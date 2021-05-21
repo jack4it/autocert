@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	authv1 "k8s.io/api/authentication/v1"
 	"net/http"
 	"os"
 	"strings"
@@ -17,13 +20,16 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/smallstep/certificates/ca"
 	"github.com/smallstep/certificates/pki"
-	"github.com/smallstep/cli/crypto/pemutil"
 	"github.com/smallstep/cli/utils"
+	"go.step.sm/crypto/pemutil"
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 var (
@@ -39,9 +45,6 @@ const (
 	firstAnnotationKey            = "autocert.step.sm/init-first"
 	sansAnnotationKey             = "autocert.step.sm/sans"
 	volumeMountPath               = "/var/run/autocert.step.sm"
-	tokenSecretKey                = "token"
-	tokenSecretLabel              = "autocert.step.sm/token"
-	tokenLifetime                 = 5 * time.Minute
 )
 
 // Config options for the autocert admission controller.
@@ -54,6 +57,7 @@ type Config struct {
 	Bootstrapper                    corev1.Container `yaml:"bootstrapper"`
 	Renewer                         corev1.Container `yaml:"renewer"`
 	CertsVolume                     corev1.Volume    `yaml:"certsVolume"`
+	SATokenVolume                   corev1.Volume    `yaml:"saTokenVolume"`
 	RestrictCertificatesToNamespace bool             `yaml:"restrictCertificatesToNamespace"`
 	ClusterDomain                   string           `yaml:"clusterDomain"`
 	RootCAPath                      string           `yaml:"rootCAPath"`
@@ -141,120 +145,11 @@ func loadConfig(file string) (*Config, error) {
 	return &cfg, nil
 }
 
-// createTokenSecret generates a kubernetes Secret object containing a bootstrap token
-// in the specified namespace. The secret name is randomly generated with a given prefix.
-// A goroutine is scheduled to cleanup the secret after the token expires. The secret
-// is also labelled for easy identification and manual cleanup.
-func createTokenSecret(prefix, namespace, token string) (string, error) {
-	secret := corev1.Secret{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Secret",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: prefix,
-			Namespace:    namespace,
-			Labels: map[string]string{
-				tokenSecretLabel: "true",
-			},
-		},
-		StringData: map[string]string{
-			tokenSecretKey: token,
-		},
-		Type: corev1.SecretTypeOpaque,
-	}
-
-	client, err := NewInClusterK8sClient()
-	if err != nil {
-		return "", err
-	}
-
-	body, err := json.Marshal(secret)
-	if err != nil {
-		return "", err
-	}
-	log.WithField("secret", string(body)).Debug("Creating secret")
-
-	req, err := client.PostRequest(fmt.Sprintf("api/v1/namespaces/%s/secrets", namespace), string(body), "application/json")
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Errorf("Secret creation error. Response: %v", resp)
-		return "", errors.Wrap(err, "secret creation")
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Errorf("Secret creation error (!2XX). Response: %v", resp)
-		var rbody []byte
-		if resp.Body != nil {
-			if data, err := ioutil.ReadAll(resp.Body); err == nil {
-				rbody = data
-			}
-		}
-		log.Error("Error body: ", string(rbody))
-		return "", errors.New("Not 200")
-	}
-
-	var rbody []byte
-	if resp.Body != nil {
-		if data, err := ioutil.ReadAll(resp.Body); err == nil {
-			rbody = data
-		}
-	}
-	if len(rbody) == 0 {
-		return "", errors.New("Empty response body")
-	}
-
-	var created *corev1.Secret
-	if err := json.Unmarshal(rbody, &created); err != nil {
-		return "", errors.Wrap(err, "Error unmarshalling secret response")
-	}
-
-	// Clean up after ourselves by deleting the Secret after the bootstrap
-	// token expires. This is best effort -- obviously we'll miss some stuff
-	// if this process goes away -- but the secrets are also labelled so
-	// it's also easy to clean them up in bulk using kubectl if we miss any.
-	go func() {
-		time.Sleep(tokenLifetime)
-		req, err := client.DeleteRequest(fmt.Sprintf("api/v1/namespaces/%s/secrets/%s", namespace, created.Name))
-		ctxLog := log.WithFields(log.Fields{
-			"name":      created.Name,
-			"namespace": namespace,
-		})
-		if err != nil {
-			ctxLog.WithField("error", err).Error("Error deleting expired bootstrap token secret")
-			return
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			ctxLog.WithField("error", err).Error("Error deleting expired bootstrap token secret")
-			return
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			ctxLog.WithFields(log.Fields{
-				"status":     resp.Status,
-				"statusCode": resp.StatusCode,
-			}).Error("Error deleting expired bootstrap token secret")
-			return
-		}
-		ctxLog.Info("Deleted expired bootstrap token secret")
-	}()
-
-	return created.Name, err
-}
-
 // mkBootstrapper generates a bootstrap container based on the template defined in Config. It
 // generates a new bootstrap token and mounts it, along with other required configuration, as
 // environment variables in the returned bootstrap container.
-func mkBootstrapper(config *Config, podName, commonName, duration, namespace string, sans []string, provisioner *ca.Provisioner) (corev1.Container, error) {
+func mkBootstrapper(config *Config, podName, commonName, duration, namespace string) (corev1.Container, error) {
 	b := config.Bootstrapper
-
-	token, err := provisioner.Token(commonName, sans...)
-	if err != nil {
-		return b, errors.Wrap(err, "token generation")
-	}
 
 	// Generate CA fingerprint
 	crt, err := pemutil.ReadCertificate(config.GetRootCAPath())
@@ -264,12 +159,6 @@ func mkBootstrapper(config *Config, podName, commonName, duration, namespace str
 	sum := sha256.Sum256(crt.Raw)
 	fingerprint := strings.ToLower(hex.EncodeToString(sum[:]))
 
-	secretName, err := createTokenSecret(commonName+"-", namespace, token)
-	if err != nil {
-		return b, errors.Wrap(err, "create token secret")
-	}
-	log.Infof("Secret name is: %s", secretName)
-
 	b.Env = append(b.Env, corev1.EnvVar{
 		Name:  "COMMON_NAME",
 		Value: commonName,
@@ -277,18 +166,6 @@ func mkBootstrapper(config *Config, podName, commonName, duration, namespace str
 	b.Env = append(b.Env, corev1.EnvVar{
 		Name:  "DURATION",
 		Value: duration,
-	})
-
-	b.Env = append(b.Env, corev1.EnvVar{
-		Name: "STEP_TOKEN",
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: secretName,
-				},
-				Key: tokenSecretKey,
-			},
-		},
 	})
 	b.Env = append(b.Env, corev1.EnvVar{
 		Name:  "STEP_CA_URL",
@@ -314,6 +191,8 @@ func mkBootstrapper(config *Config, podName, commonName, duration, namespace str
 		Name:  "CLUSTER_DOMAIN",
 		Value: config.ClusterDomain,
 	})
+
+	b.TTY = true
 
 	return b, nil
 }
@@ -460,7 +339,7 @@ func addAnnotations(existing, new map[string]string) (ops []PatchOperation) {
 //  - Add the `certs` volume definition
 //  - Annotate the pod to indicate that it's been processed by this controller
 // The result is a list of serialized JSONPatch objects (or an error).
-func patch(pod *corev1.Pod, namespace string, config *Config, provisioner *ca.Provisioner) ([]byte, error) {
+func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 	var ops []PatchOperation
 
 	name := pod.ObjectMeta.GetName()
@@ -471,13 +350,9 @@ func patch(pod *corev1.Pod, namespace string, config *Config, provisioner *ca.Pr
 	annotations := pod.ObjectMeta.GetAnnotations()
 	commonName := annotations[admissionWebhookAnnotationKey]
 	first := annotations[firstAnnotationKey] == "true"
-	sans := strings.Split(annotations[sansAnnotationKey], ",")
-	if len(annotations[sansAnnotationKey]) == 0 {
-		sans = []string{commonName}
-	}
 	duration := annotations[durationWebhookStatusKey]
 	renewer := mkRenewer(config, name, commonName, namespace)
-	bootstrapper, err := mkBootstrapper(config, name, commonName, duration, namespace, sans, provisioner)
+	bootstrapper, err := mkBootstrapper(config, name, commonName, duration, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -495,8 +370,10 @@ func patch(pod *corev1.Pod, namespace string, config *Config, provisioner *ca.Pr
 
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.Containers, "containers", false)...)
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
+	ops = append(ops, addCertsVolumeMount(config.SATokenVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
 	ops = append(ops, addContainers(pod.Spec.Containers, []corev1.Container{renewer}, "/spec/containers")...)
 	ops = append(ops, addVolumes(pod.Spec.Volumes, []corev1.Volume{config.CertsVolume}, "/spec/volumes")...)
+	ops = append(ops, addVolumes(pod.Spec.Volumes, []corev1.Volume{config.SATokenVolume}, "/spec/volumes")...)
 	ops = append(ops, addAnnotations(pod.Annotations, map[string]string{admissionWebhookStatusKey: "injected"})...)
 
 	return json.Marshal(ops)
@@ -541,7 +418,7 @@ func shouldMutate(metadata *metav1.ObjectMeta, namespace string, clusterDomain s
 
 // mutate takes an `AdmissionReview`, determines whether it is subject to mutation, and returns
 // an appropriate `AdmissionResponse` including patches or any errors that occurred.
-func mutate(review *v1beta1.AdmissionReview, config *Config, provisioner *ca.Provisioner) *v1beta1.AdmissionResponse {
+func mutate(review *v1beta1.AdmissionReview, config *Config) *v1beta1.AdmissionResponse {
 	ctxLog := log.WithField("uid", review.Request.UID)
 
 	request := review.Request
@@ -587,7 +464,7 @@ func mutate(review *v1beta1.AdmissionReview, config *Config, provisioner *ca.Pro
 		}
 	}
 
-	patchBytes, err := patch(&pod, request.Namespace, config, provisioner)
+	patchBytes, err := patch(&pod, request.Namespace, config)
 	if err != nil {
 		ctxLog.WithField("error", err).Error("Error generating patch")
 		return &v1beta1.AdmissionResponse{
@@ -680,9 +557,24 @@ func main() {
 		Addr: config.GetAddress(),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/healthz" {
-				log.Info("/healthz")
+				log.Debug("/healthz")
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprintln(w, "ok")
+				return
+			}
+
+			if r.URL.Path == "/token" {
+				log.Debug("/token")
+
+				token, status, err := handleTokenRequest(ctx, provisioner, r)
+				if err != nil {
+					log.WithError(err).Error("error occurred while processing token request")
+					w.WriteHeader(status)
+					return
+				}
+
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, token)
 				return
 			}
 
@@ -725,7 +617,7 @@ func main() {
 					},
 				}
 			} else {
-				response = mutate(&review, config, provisioner)
+				response = mutate(&review, config)
 			}
 
 			resp, err := json.Marshal(v1beta1.AdmissionReview{
@@ -759,4 +651,146 @@ func main() {
 	if err := srv.ListenAndServeTLS("", ""); err != nil {
 		panic(err)
 	}
+}
+
+// handleTokenRequest authorizes the request by sending a TokenReview with the service account token to apiserver,
+// then it will generate a token with the pod IP as part of the SANs and send it back to the bootstrapper
+func handleTokenRequest(ctx context.Context, provisioner *ca.Provisioner, r *http.Request) (string, int, error) {
+	var token string
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return token, http.StatusUnauthorized, errors.New("missing authorization header")
+	}
+
+	// TODO: Make this a bit more robust, parsing-wise
+	authHeaderParts := strings.Fields(authHeader)
+	if len(authHeaderParts) != 2 || strings.ToLower(authHeaderParts[0]) != "bearer" {
+		return token, http.StatusBadRequest, errors.New("Authorization header format must be Bearer {token}")
+	}
+
+	saToken := authHeaderParts[1]
+
+	c, err := getK8sClient()
+	if err != nil {
+		return token, http.StatusInternalServerError, err
+	}
+
+	review := authv1.TokenReview{Spec: authv1.TokenReviewSpec{
+		Token:     saToken,
+		Audiences: []string{"autocert"},
+	}}
+	resp, err := c.AuthenticationV1().TokenReviews().Create(ctx, &review, metav1.CreateOptions{})
+	if err != nil {
+		return token, http.StatusInternalServerError, err
+	}
+
+	if !resp.Status.Authenticated {
+		return token, http.StatusUnauthorized, errors.New("invalid sa token")
+	}
+
+	saTokenParsed, err := parseSAToken(saToken)
+	if err != nil {
+		return token, http.StatusInternalServerError, err
+	}
+
+	token, err = generateToken(provisioner, saTokenParsed.K8s.Namespace, saTokenParsed.K8s.Pod.Name)
+	if err != nil {
+		return token, http.StatusInternalServerError, err
+	}
+
+	return token, http.StatusOK, nil
+}
+
+func parseSAToken(saTokenString string) (saToken, error) {
+	token := saToken{}
+
+	parts := strings.Split(saTokenString, ".")
+	seg := parts[1]
+	if l := len(seg) % 4; l > 0 {
+		seg += strings.Repeat("=", 4-l)
+	}
+
+	segment, err := base64.URLEncoding.DecodeString(seg)
+	if err != nil {
+		return token, err
+	}
+
+	decoder := json.NewDecoder(bytes.NewBuffer(segment))
+	err = decoder.Decode(&token)
+	if err != nil {
+		return token, err
+	}
+
+	return token, nil
+}
+
+type saToken struct {
+	K8s struct {
+		Namespace string `json:"namespace,omitempty"`
+		Pod       struct {
+			Name string `json:"name,omitempty"`
+		} `json:"pod,omitempty"`
+	} `json:"kubernetes.io,omitempty"`
+}
+
+func generateToken(provisioner *ca.Provisioner, ns string, podName string) (string, error) {
+	c, err := getK8sClient()
+	if err != nil {
+		return "", err
+	}
+
+	var pod *corev1.Pod
+	var counter int
+	timeout, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
+	err = wait.PollImmediateUntil(2*time.Second, func() (done bool, err error) {
+		log.WithField("counter", counter).Info("fetching pod IP")
+		counter++
+		var e error
+		pod, e = c.CoreV1().Pods(ns).Get(timeout, podName, metav1.GetOptions{})
+		if e != nil {
+			log.WithError(e).Error("failed to fetch pod IP")
+			return false, nil
+		}
+
+		return pod.Status.PodIP != "", nil
+	}, timeout.Done())
+	cancelFunc()
+	if err != nil {
+		return "", err
+	}
+
+	annotations := pod.ObjectMeta.GetAnnotations()
+	commonName := annotations[admissionWebhookAnnotationKey]
+
+	splitFn := func(c rune) bool {
+		return c == ','
+	}
+
+	sans := strings.FieldsFunc(annotations[sansAnnotationKey], splitFn)
+	if len(sans) == 0 {
+		sans = []string{commonName}
+	}
+	sans = append(sans, pod.Status.PodIP)
+	log.Info("sans:", sans)
+
+	token, err := provisioner.Token(commonName, sans...)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to generate token")
+	}
+
+	return token, nil
+}
+
+func getK8sClient() (*kubernetes.Clientset, error) {
+	kc, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	kubeClient, err := kubernetes.NewForConfig(kc)
+	if err != nil {
+		return nil, err
+	}
+
+	return kubeClient, nil
 }
