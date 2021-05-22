@@ -13,7 +13,7 @@ docker build -t cr.step.sm/smallstep/autocert-bootstrapper:0.14.0 . && kind load
 For formal build:
 
 ```bash
-docker build -t truvetadevacr.azurecr.io/autocert-bootstrapper:1.0 .
+docker build -t truvetadevacr.azurecr.io/autocert-bootstrapper:1.2 .
 ```
 
 ## Build controller image
