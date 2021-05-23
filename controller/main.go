@@ -566,7 +566,7 @@ func main() {
 			if r.URL.Path == "/token" {
 				log.Debug("/token")
 
-				token, status, err := handleTokenRequest(ctx, provisioner, r)
+				token, status, err := handleTokenRequest(ctx, provisioner, r, config)
 				if err != nil {
 					log.WithError(err).Error("error occurred while processing token request")
 					w.WriteHeader(status)
@@ -655,7 +655,7 @@ func main() {
 
 // handleTokenRequest authorizes the request by sending a TokenReview with the service account token to apiserver,
 // then it will generate a token with the pod IP as part of the SANs and send it back to the bootstrapper
-func handleTokenRequest(ctx context.Context, provisioner *ca.Provisioner, r *http.Request) (string, int, error) {
+func handleTokenRequest(ctx context.Context, provisioner *ca.Provisioner, r *http.Request, config *Config) (string, int, error) {
 	var token string
 
 	authHeader := r.Header.Get("Authorization")
@@ -694,7 +694,7 @@ func handleTokenRequest(ctx context.Context, provisioner *ca.Provisioner, r *htt
 		return token, http.StatusInternalServerError, err
 	}
 
-	token, err = generateToken(provisioner, saTokenParsed.K8s.Namespace, saTokenParsed.K8s.Pod.Name)
+	token, err = generateToken(provisioner, saTokenParsed.K8s.Namespace, saTokenParsed.K8s.Pod.Name, config.ClusterDomain)
 	if err != nil {
 		return token, http.StatusInternalServerError, err
 	}
@@ -734,7 +734,7 @@ type saToken struct {
 	} `json:"kubernetes.io,omitempty"`
 }
 
-func generateToken(provisioner *ca.Provisioner, ns string, podName string) (string, error) {
+func generateToken(provisioner *ca.Provisioner, ns string, podName string, domain string) (string, error) {
 	c, err := getK8sClient()
 	if err != nil {
 		return "", err
@@ -763,6 +763,32 @@ func generateToken(provisioner *ca.Provisioner, ns string, podName string) (stri
 	annotations := pod.ObjectMeta.GetAnnotations()
 	commonName := annotations[admissionWebhookAnnotationKey]
 
+	splitCommonNameFn := func(c rune) bool {
+		return c == '.'
+	}
+
+	segments := strings.FieldsFunc(commonName, splitCommonNameFn)
+	if len(segments) <= 0 {
+		return "", errors.Errorf("invalid common name: %s", commonName)
+	}
+
+	svcName := segments[0]
+	timeout, cancelFunc = context.WithTimeout(context.Background(), 10*time.Second)
+	service, err := c.CoreV1().Services(ns).Get(timeout, svcName, metav1.GetOptions{})
+	cancelFunc()
+	if err != nil {
+		return "", err
+	}
+
+	svcSans := []string{svcName,
+		fmt.Sprintf("%s.%s", svcName, ns),
+		fmt.Sprintf("%s.%s.svc", svcName, ns),
+		fmt.Sprintf("%s.%s.svc.%s", svcName, ns, domain),
+		service.Spec.ClusterIP}
+	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		svcSans = append(svcSans, service.Spec.LoadBalancerIP)
+	}
+
 	splitFn := func(c rune) bool {
 		return c == ','
 	}
@@ -771,7 +797,8 @@ func generateToken(provisioner *ca.Provisioner, ns string, podName string) (stri
 	if len(sans) == 0 {
 		sans = []string{commonName}
 	}
-	sans = append(sans, pod.Status.PodIP)
+	sans = append(sans, svcSans...)
+	sans = append(sans, pod.Status.PodIP, "localhost", "127.0.0.1")
 	log.Info("sans:", sans)
 
 	token, err := provisioner.Token(commonName, sans...)
