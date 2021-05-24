@@ -786,7 +786,12 @@ func generateToken(provisioner *ca.Provisioner, ns string, podName string, domai
 		fmt.Sprintf("%s.%s.svc.%s", svcName, ns, domain),
 		service.Spec.ClusterIP}
 	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-		svcSans = append(svcSans, service.Spec.LoadBalancerIP)
+		ing := service.Status.LoadBalancer.Ingress
+		if len(ing) <= 0 {
+			log.Warnf("external IP address of the LB service [%s] not available, skipping", svcName)
+		} else {
+			svcSans = append(svcSans, ing[0].IP)
+		}
 	}
 
 	splitFn := func(c rune) bool {
