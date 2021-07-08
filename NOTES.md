@@ -16,6 +16,16 @@ For formal build:
 docker build -t truvetadevacr.azurecr.io/autocert-bootstrapper:1.2 .
 ```
 
+## Build renewer image
+
+Inside directory `./renewer/`
+
+For formal build:
+
+```bash
+docker build -t truvetadevacr.azurecr.io/autocert-renewer:1.0 .
+```
+
 ## Build controller image
 
 For local KIND cluster test:
