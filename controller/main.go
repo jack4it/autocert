@@ -22,7 +22,7 @@ import (
 	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/utils"
 	"go.step.sm/crypto/pemutil"
-	"k8s.io/api/admission/v1beta1"
+	"k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -437,14 +437,14 @@ func shouldMutate(metadata *metav1.ObjectMeta, namespace string, clusterDomain s
 
 // mutate takes an `AdmissionReview`, determines whether it is subject to mutation, and returns
 // an appropriate `AdmissionResponse` including patches or any errors that occurred.
-func mutate(review *v1beta1.AdmissionReview, config *Config) *v1beta1.AdmissionResponse {
+func mutate(review *v1.AdmissionReview, config *Config) *v1.AdmissionResponse {
 	ctxLog := log.WithField("uid", review.Request.UID)
 
 	request := review.Request
 	var pod corev1.Pod
 	if err := json.Unmarshal(request.Object.Raw, &pod); err != nil {
 		ctxLog.WithField("error", err).Error("Error unmarshaling pod")
-		return &v1beta1.AdmissionResponse{
+		return &v1.AdmissionResponse{
 			Allowed: false,
 			UID:     request.UID,
 			Result: &metav1.Status{
@@ -466,7 +466,7 @@ func mutate(review *v1beta1.AdmissionReview, config *Config) *v1beta1.AdmissionR
 
 	if validationErr != nil {
 		ctxLog.WithField("error", validationErr).Info("Validation error")
-		return &v1beta1.AdmissionResponse{
+		return &v1.AdmissionResponse{
 			Allowed: false,
 			UID:     request.UID,
 			Result: &metav1.Status{
@@ -477,7 +477,7 @@ func mutate(review *v1beta1.AdmissionReview, config *Config) *v1beta1.AdmissionR
 
 	if !mutationAllowed {
 		ctxLog.WithField("annotations", pod.Annotations).Info("Skipping mutation")
-		return &v1beta1.AdmissionResponse{
+		return &v1.AdmissionResponse{
 			Allowed: true,
 			UID:     request.UID,
 		}
@@ -486,7 +486,7 @@ func mutate(review *v1beta1.AdmissionReview, config *Config) *v1beta1.AdmissionR
 	patchBytes, err := patch(&pod, request.Namespace, config)
 	if err != nil {
 		ctxLog.WithField("error", err).Error("Error generating patch")
-		return &v1beta1.AdmissionResponse{
+		return &v1.AdmissionResponse{
 			Allowed: false,
 			UID:     request.UID,
 			Result: &metav1.Status{
@@ -496,12 +496,12 @@ func mutate(review *v1beta1.AdmissionReview, config *Config) *v1beta1.AdmissionR
 	}
 
 	ctxLog.WithField("patch", string(patchBytes)).Info("Generated patch")
-	return &v1beta1.AdmissionResponse{
+	return &v1.AdmissionResponse{
 		Allowed: true,
 		Patch:   patchBytes,
 		UID:     request.UID,
-		PatchType: func() *v1beta1.PatchType {
-			pt := v1beta1.PatchTypeJSONPatch
+		PatchType: func() *v1.PatchType {
+			pt := v1.PatchTypeJSONPatch
 			return &pt
 		}(),
 	}
@@ -622,14 +622,19 @@ func main() {
 				return
 			}
 
-			var response *v1beta1.AdmissionResponse
-			review := v1beta1.AdmissionReview{}
+			var response *v1.AdmissionResponse
+			review := v1.AdmissionReview{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: v1.SchemeGroupVersion.String(),
+					Kind: "AdmissionReview",
+				},
+			}
 			if _, _, err := deserializer.Decode(body, nil, &review); err != nil {
 				log.WithFields(log.Fields{
 					"body":  body,
 					"error": err,
 				}).Error("Can't decode body")
-				response = &v1beta1.AdmissionResponse{
+				response = &v1.AdmissionResponse{
 					Allowed: false,
 					Result: &metav1.Status{
 						Message: err.Error(),
@@ -639,7 +644,11 @@ func main() {
 				response = mutate(&review, config)
 			}
 
-			resp, err := json.Marshal(v1beta1.AdmissionReview{
+			resp, err := json.Marshal(v1.AdmissionReview{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: v1.SchemeGroupVersion.String(),
+					Kind: "AdmissionReview",
+				},
 				Response: response,
 			})
 			if err != nil {
