@@ -39,6 +39,7 @@ var (
 )
 
 const (
+	rootOnlyKey = "autocert.step.sm/root-only"
 	admissionWebhookAnnotationKey = "autocert.step.sm/name"
 	admissionWebhookStatusKey     = "autocert.step.sm/status"
 	durationWebhookStatusKey      = "autocert.step.sm/duration"
@@ -148,7 +149,7 @@ func loadConfig(file string) (*Config, error) {
 // mkBootstrapper generates a bootstrap container based on the template defined in Config. It
 // generates a new bootstrap token and mounts it, along with other required configuration, as
 // environment variables in the returned bootstrap container.
-func mkBootstrapper(config *Config, podName, commonName, duration, namespace string) (corev1.Container, error) {
+func mkBootstrapper(config *Config, podName string, rootOnly bool, commonName, duration, namespace string) (corev1.Container, error) {
 	b := config.Bootstrapper
 
 	// Generate CA fingerprint
@@ -158,6 +159,13 @@ func mkBootstrapper(config *Config, podName, commonName, duration, namespace str
 	}
 	sum := sha256.Sum256(crt.Raw)
 	fingerprint := strings.ToLower(hex.EncodeToString(sum[:]))
+
+	if rootOnly {
+		b.Env = append(b.Env, corev1.EnvVar{
+			Name:  "ROOT_ONLY",
+			Value: "true",
+		})
+	}
 
 	b.Env = append(b.Env, corev1.EnvVar{
 		Name:  "COMMON_NAME",
@@ -348,11 +356,12 @@ func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 	}
 
 	annotations := pod.ObjectMeta.GetAnnotations()
+	rootOnly := annotations[rootOnlyKey] == "true"
 	commonName := annotations[admissionWebhookAnnotationKey]
 	first := annotations[firstAnnotationKey] == "true"
 	duration := annotations[durationWebhookStatusKey]
 	renewer := mkRenewer(config, name, commonName, namespace)
-	bootstrapper, err := mkBootstrapper(config, name, commonName, duration, namespace)
+	bootstrapper, err := mkBootstrapper(config, name, rootOnly, commonName, duration, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +380,9 @@ func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.Containers, "containers", false)...)
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
 	ops = append(ops, addCertsVolumeMount(config.SATokenVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
-	ops = append(ops, addContainers(pod.Spec.Containers, []corev1.Container{renewer}, "/spec/containers")...)
+	if ! rootOnly {
+		ops = append(ops, addContainers(pod.Spec.Containers, []corev1.Container{renewer}, "/spec/containers")...)
+	}
 	ops = append(ops, addVolumes(pod.Spec.Volumes, []corev1.Volume{config.CertsVolume}, "/spec/volumes")...)
 	ops = append(ops, addVolumes(pod.Spec.Volumes, []corev1.Volume{config.SATokenVolume}, "/spec/volumes")...)
 	ops = append(ops, addAnnotations(pod.Annotations, map[string]string{admissionWebhookStatusKey: "injected"})...)
@@ -393,7 +404,15 @@ func shouldMutate(metadata *metav1.ObjectMeta, namespace string, clusterDomain s
 
 	// Only mutate if the object is annotated appropriately (annotation key set) and we haven't
 	// mutated already (status key isn't set).
-	if annotations[admissionWebhookAnnotationKey] == "" || annotations[admissionWebhookStatusKey] == "injected" {
+	if annotations[admissionWebhookStatusKey] == "injected" {
+		return false, nil
+	}
+
+	if annotations[rootOnlyKey] == "true" {
+		return true, nil
+	}
+
+	if annotations[admissionWebhookAnnotationKey] == "" {
 		return false, nil
 	}
 

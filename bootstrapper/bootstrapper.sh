@@ -12,6 +12,11 @@ set -e
 step ca root $STEP_ROOT --force
 chmod 644 $STEP_ROOT
 
+if [ "$ROOT_ONLY" == "true" ]; then
+  echo "fetch root certificate only; exiting..."
+  exit
+fi
+
 #step certificate inspect $STEP_ROOT --short
 #step certificate inspect https://"${AUTOCERT_SVC:-autocert.ca.svc}" --roots $STEP_ROOT --short
 
