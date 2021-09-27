@@ -379,7 +379,6 @@ func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.Containers, "containers", false)...)
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
-	ops = append(ops, addCertsVolumeMount(config.SATokenVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
 	if ! rootOnly {
 		ops = append(ops, addContainers(pod.Spec.Containers, []corev1.Container{renewer}, "/spec/containers")...)
 	}
