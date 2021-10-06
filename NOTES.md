@@ -13,7 +13,7 @@ docker build -t cr.step.sm/smallstep/autocert-bootstrapper:0.14.0 . && kind load
 For formal build:
 
 ```bash
-docker build -t truvetadevacr.azurecr.io/autocert-bootstrapper:1.2 .
+docker build -t truvetadevacr.azurecr.io/autocert-bootstrapper:1.4 .
 ```
 
 ## Build renewer image
@@ -23,7 +23,7 @@ Inside directory `./renewer/`
 For formal build:
 
 ```bash
-docker build -t truvetadevacr.azurecr.io/autocert-renewer:1.0 .
+docker build -t truvetadevacr.azurecr.io/autocert-renewer:1.1 .
 ```
 
 ## Build controller image
@@ -37,5 +37,5 @@ docker build . -t cr.step.sm/smallstep/autocert-controller:0.14.0 && kind load d
 For formal build:
 
 ```bash
-docker build -t truvetadevacr.azurecr.io/autocert-controller:1.5 .
+docker build -t truvetadevacr.azurecr.io/autocert-controller:1.6 .
 ```
