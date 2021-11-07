@@ -61,6 +61,7 @@ type Config struct {
 	SATokenVolume                   corev1.Volume    `yaml:"saTokenVolume"`
 	RestrictCertificatesToNamespace bool             `yaml:"restrictCertificatesToNamespace"`
 	ClusterDomain                   string           `yaml:"clusterDomain"`
+	InternalDomain                  string           `yaml:"internalDomain"`
 	RootCAPath                      string           `yaml:"rootCAPath"`
 	ProvisionerPasswordPath         string           `yaml:"provisionerPasswordPath"`
 }
@@ -721,7 +722,7 @@ func handleTokenRequest(ctx context.Context, provisioner *ca.Provisioner, r *htt
 		return token, http.StatusInternalServerError, err
 	}
 
-	token, err = generateToken(provisioner, saTokenParsed.K8s.Namespace, saTokenParsed.K8s.Pod.Name, config.ClusterDomain)
+	token, err = generateToken(provisioner, saTokenParsed.K8s.Namespace, saTokenParsed.K8s.Pod.Name, config.ClusterDomain, config.InternalDomain)
 	if err != nil {
 		return token, http.StatusInternalServerError, err
 	}
@@ -761,7 +762,7 @@ type saToken struct {
 	} `json:"kubernetes.io,omitempty"`
 }
 
-func generateToken(provisioner *ca.Provisioner, ns string, podName string, domain string) (string, error) {
+func generateToken(provisioner *ca.Provisioner, ns string, podName string, domain string, internalDomain string) (string, error) {
 	c, err := getK8sClient()
 	if err != nil {
 		return "", err
@@ -818,6 +819,10 @@ func generateToken(provisioner *ca.Provisioner, ns string, podName string, domai
 			log.Warnf("external IP address of the LB service [%s] not available, skipping", svcName)
 		} else {
 			svcSans = append(svcSans, ing[0].IP)
+		}
+
+		if internalDomain != "" {
+			svcSans = append(svcSans, fmt.Sprintf("%s.%s", svcName, internalDomain))
 		}
 	}
 
