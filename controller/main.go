@@ -21,7 +21,7 @@ import (
 	"github.com/smallstep/certificates/pki"
 	"github.com/smallstep/cli/utils"
 	"go.step.sm/crypto/pemutil"
-	"k8s.io/api/admission/v1"
+	v1 "k8s.io/api/admission/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -361,10 +361,6 @@ func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 	rootOnly := annotations[rootOnlyKey] == "true"
 	commonName := annotations[admissionWebhookAnnotationKey]
 	first := strings.EqualFold(annotations[firstAnnotationKey], "true")
-	sans := strings.Split(annotations[sansAnnotationKey], ",")
-	if len(annotations[sansAnnotationKey]) == 0 {
-		sans = []string{commonName}
-	}
 	bootstrapperOnly := strings.EqualFold(annotations[bootstrapperOnlyAnnotationKey], "true")
 	duration := annotations[durationWebhookStatusKey]
 	renewer := mkRenewer(config, name, commonName, namespace)

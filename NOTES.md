@@ -37,5 +37,5 @@ docker build . -t cr.step.sm/smallstep/autocert-controller:0.14.0 && kind load d
 For formal build:
 
 ```bash
-docker build -t truvetadevacr.azurecr.io/autocert-controller:1.7 .
+docker build -t truvetadevacr.azurecr.io/autocert-controller:1.8 .
 ```

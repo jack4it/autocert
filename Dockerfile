@@ -1,9 +1,10 @@
 # build stage
-FROM golang:alpine AS build-env
+FROM golang:1.17-alpine AS build-env
 RUN apk update && apk upgrade && \
     apk add --no-cache git
 
 WORKDIR $GOPATH/src/github.com/autocert/controller
+RUN go version
 COPY go.mod go.sum ./
 COPY controller/client.go controller/main.go ./
 RUN go build -o /server .
