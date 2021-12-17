@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	authv1 "k8s.io/api/authentication/v1"
 	"net/http"
 	"os"
 	"strings"
@@ -23,6 +22,7 @@ import (
 	"github.com/smallstep/cli/utils"
 	"go.step.sm/crypto/pemutil"
 	"k8s.io/api/admission/v1"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,11 +39,12 @@ var (
 )
 
 const (
-	rootOnlyKey = "autocert.step.sm/root-only"
+	rootOnlyKey                   = "autocert.step.sm/root-only"
 	admissionWebhookAnnotationKey = "autocert.step.sm/name"
 	admissionWebhookStatusKey     = "autocert.step.sm/status"
 	durationWebhookStatusKey      = "autocert.step.sm/duration"
 	firstAnnotationKey            = "autocert.step.sm/init-first"
+	bootstrapperOnlyAnnotationKey = "autocert.step.sm/bootstrapper-only"
 	sansAnnotationKey             = "autocert.step.sm/sans"
 	volumeMountPath               = "/var/run/autocert.step.sm"
 )
@@ -359,7 +360,12 @@ func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 	annotations := pod.ObjectMeta.GetAnnotations()
 	rootOnly := annotations[rootOnlyKey] == "true"
 	commonName := annotations[admissionWebhookAnnotationKey]
-	first := annotations[firstAnnotationKey] == "true"
+	first := strings.EqualFold(annotations[firstAnnotationKey], "true")
+	sans := strings.Split(annotations[sansAnnotationKey], ",")
+	if len(annotations[sansAnnotationKey]) == 0 {
+		sans = []string{commonName}
+	}
+	bootstrapperOnly := strings.EqualFold(annotations[bootstrapperOnlyAnnotationKey], "true")
 	duration := annotations[durationWebhookStatusKey]
 	renewer := mkRenewer(config, name, commonName, namespace)
 	bootstrapper, err := mkBootstrapper(config, name, rootOnly, commonName, duration, namespace)
@@ -380,7 +386,7 @@ func patch(pod *corev1.Pod, namespace string, config *Config) ([]byte, error) {
 
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.Containers, "containers", false)...)
 	ops = append(ops, addCertsVolumeMount(config.CertsVolume.Name, pod.Spec.InitContainers, "initContainers", first)...)
-	if ! rootOnly {
+	if !rootOnly && !bootstrapperOnly {
 		ops = append(ops, addContainers(pod.Spec.Containers, []corev1.Container{renewer}, "/spec/containers")...)
 	}
 	ops = append(ops, addVolumes(pod.Spec.Volumes, []corev1.Volume{config.CertsVolume}, "/spec/volumes")...)
@@ -626,7 +632,7 @@ func main() {
 			review := v1.AdmissionReview{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1.SchemeGroupVersion.String(),
-					Kind: "AdmissionReview",
+					Kind:       "AdmissionReview",
 				},
 			}
 			if _, _, err := deserializer.Decode(body, nil, &review); err != nil {
@@ -647,7 +653,7 @@ func main() {
 			resp, err := json.Marshal(v1.AdmissionReview{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: v1.SchemeGroupVersion.String(),
-					Kind: "AdmissionReview",
+					Kind:       "AdmissionReview",
 				},
 				Response: response,
 			})
